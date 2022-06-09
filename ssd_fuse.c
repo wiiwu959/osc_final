@@ -193,11 +193,33 @@ static unsigned int get_next_pca()
 static int ftl_read( char* buf, size_t lba)
 {
     // TODO
+    nand_read(buf, L2P[lba]);
+    return 0;
 }
 
 static int ftl_write(const char* buf, size_t lba_rnage, size_t lba)
 {
     // TODO
+    int lba_pca = L2P[lba];
+
+    // if pca already used, unset
+    if (lba_pca != INVALID_LBA) {
+        PCA_RULE pca;
+        pca.pca = lba_pca;
+        P2L[pca.fields.nand * PAGE_PER_BLOCK + pca.fields.lba] = INVALID_LBA;
+        valid_count[pca.fields.nand]--;
+    }
+    
+    // allocate new pca and set L2P P2L
+    int new_lba_pca = get_next_pca();
+    L2P[lba] = new_lba_pca;
+
+    PCA_RULE new_pca;
+    new_pca.pca = new_lba_pca;
+    P2L[new_pca.fields.nand * PAGE_PER_BLOCK + new_pca.fields.lba] = lba;
+
+    nand_write(buf, new_lba_pca);
+    return 0;
 }
 
 
@@ -268,6 +290,7 @@ static int ssd_do_read(char* buf, size_t size, off_t offset)
 
     for (int i = 0; i < tmp_lba_range; i++) {
         // TODO
+        ftl_read(tmp_buf + (512 * i), tmp_lba + i);
     }
 
     memcpy(buf, tmp_buf + offset % 512, size);
@@ -307,6 +330,7 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
     for (idx = 0; idx < tmp_lba_range; idx++)
     {
         // TODO
+        ftl_write(buf + (512 * idx), tmp_lba_range, tmp_lba + idx);
     }
     return size;
 }

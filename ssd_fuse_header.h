@@ -17,7 +17,7 @@
 #define OUT_OF_BLOCK     (0xFFFF)
 #define FULL_PCA     (0xFFFFFFFE)
 #define PAGE_PER_BLOCK     (10)
-#define NAND_LOCATION  "/home/Alan/ssd_fuse"
+#define NAND_LOCATION  "/home/wii/osc_final"
 
 enum
 {
