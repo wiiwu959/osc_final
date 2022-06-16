@@ -45,6 +45,13 @@ static unsigned int get_next_pca();
 
 unsigned int* L2P,* P2L,* valid_count, free_block_number;
 
+int get_idx(int lba_pca)
+{
+    PCA_RULE pca;
+    pca.pca = lba_pca;
+    return (pca.fields.nand * PAGE_PER_BLOCK + pca.fields.lba);
+}
+
 static int ssd_resize(size_t new_size)
 {
     //set logic size to new_size
@@ -139,6 +146,61 @@ static int nand_erase(int block_index)
     return 1;
 }
 
+/*
+ * 1. Decide the target block to be erase
+ * 2. Move all the valid data that in target block to another block
+ * 3. Erase the target block when all the data in target block are stale
+ * 4. Mark the target block as available
+ * 5. Continue until the number of blocks that you erased reach your goal
+ */
+static void gc(void)
+{
+    int target = -1;
+    int min_valid = PAGE_PER_BLOCK + 1;
+    
+    // Find target
+    for (int i = 1; i < PHYSICAL_NAND_NUM; i++) {
+        if (valid_count[i] < min_valid && curr_pca.fields.nand != i) {
+            min_valid = valid_count[i];
+            target = i;
+        }
+    }
+    printf("Find block %d with %d valid_count to do gc\n", target, min_valid);
+
+    if (target == -1) {
+        printf("No free space to do gc\n");
+        return;
+    }
+
+    char* buf = calloc(512, sizeof(char));
+    for (int i = 0; i < PAGE_PER_BLOCK; i++) {
+        PCA_RULE pca;
+        pca.fields.nand = target;
+        pca.fields.lba = i;
+        
+        int old_pca = pca.pca;
+        int old_lba =  P2L[get_idx(old_pca)];
+        
+        if (old_lba != INVALID_LBA) {
+            int new_pca = get_next_pca();
+            if (new_pca == OUT_OF_BLOCK) {
+                break;
+            }
+
+            old_pca = L2P[old_lba];
+            L2P[old_lba] = new_pca;
+            P2L[get_idx(new_pca)] = old_lba;
+            P2L[get_idx(old_pca)] = INVALID_LBA;
+            
+            nand_read(buf, old_pca);
+            nand_write(buf, new_pca);
+        }
+    }
+    nand_erase(target);
+    free_block_number++;
+    free(buf);
+}
+
 static unsigned int get_next_block()
 {
     for (int i = 0; i < PHYSICAL_NAND_NUM; i++)
@@ -189,37 +251,45 @@ static unsigned int get_next_pca()
 
 }
 
-
 static int ftl_read( char* buf, size_t lba)
 {
-    // TODO
-    nand_read(buf, L2P[lba]);
-    return 0;
+    int pca = L2P[lba];
+    if (pca == INVALID_PCA) { return 0; }
+    return nand_read(buf, pca);
 }
 
-static int ftl_write(const char* buf, size_t lba_rnage, size_t lba)
+static int ftl_write(const char* buf, size_t lba_range, size_t lba)
 {
-    // TODO
-    int lba_pca = L2P[lba];
+    int ret = 0;
+    for (int i = 0; i < lba_range; i++) {
+        while (free_block_number < 1) {
+            int cur_free = free_block_number;
+            gc();
+            if (free_block_number == cur_free) {
+                printf("No more block to free.\n");
+                return -1;
+            }
+        }
+        int lba_pca = L2P[lba];
+        
+        // if pca already used, unset
+        if (lba_pca != INVALID_LBA) {
+            PCA_RULE pca;
+            pca.pca = lba_pca;
+            P2L[get_idx(lba_pca)] = INVALID_LBA;
+            valid_count[pca.fields.nand]--;
+        }
+        
+        // allocate new pca and set L2P P2L
+        int new_lba_pca = get_next_pca();
+        if (new_lba_pca == OUT_OF_BLOCK) { return 0; }
+        L2P[lba] = new_lba_pca;
+        P2L[get_idx(new_lba_pca)] = lba;
 
-    // if pca already used, unset
-    if (lba_pca != INVALID_LBA) {
-        PCA_RULE pca;
-        pca.pca = lba_pca;
-        P2L[pca.fields.nand * PAGE_PER_BLOCK + pca.fields.lba] = INVALID_LBA;
-        valid_count[pca.fields.nand]--;
+        ret += nand_write(buf + (512 * i), new_lba_pca);
     }
-    
-    // allocate new pca and set L2P P2L
-    int new_lba_pca = get_next_pca();
-    L2P[lba] = new_lba_pca;
 
-    PCA_RULE new_pca;
-    new_pca.pca = new_lba_pca;
-    P2L[new_pca.fields.nand * PAGE_PER_BLOCK + new_pca.fields.lba] = lba;
-
-    nand_write(buf, new_lba_pca);
-    return 0;
+    return ret;
 }
 
 
@@ -270,7 +340,7 @@ static int ssd_open(const char* path, struct fuse_file_info* fi)
 }
 static int ssd_do_read(char* buf, size_t size, off_t offset)
 {
-    int tmp_lba, tmp_lba_range, rst ;
+    int tmp_lba, tmp_lba_range;
     char* tmp_buf;
 
     //off limit
@@ -293,9 +363,7 @@ static int ssd_do_read(char* buf, size_t size, off_t offset)
         ftl_read(tmp_buf + (512 * i), tmp_lba + i);
     }
 
-    memcpy(buf, tmp_buf + offset % 512, size);
-
-    
+    memcpy(buf, tmp_buf + offset % 512, size);    
     free(tmp_buf);
     return size;
 }
@@ -311,9 +379,8 @@ static int ssd_read(const char* path, char* buf, size_t size,
 }
 static int ssd_do_write(const char* buf, size_t size, off_t offset)
 {
-    int tmp_lba, tmp_lba_range, process_size;
-    int idx, curr_size, remain_size, rst;
-    char* tmp_buf;
+    int tmp_lba, tmp_lba_range;
+    int idx = 0;
 
     host_write_size += size;
     if (ssd_expand(offset + size) != 0)
@@ -324,14 +391,31 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
     tmp_lba = offset / 512;
     tmp_lba_range = (offset + size - 1) / 512 - (tmp_lba) + 1;
 
-    process_size = 0;
-    remain_size = size;
-    curr_size = 0;
-    for (idx = 0; idx < tmp_lba_range; idx++)
-    {
-        // TODO
-        ftl_write(buf + (512 * idx), tmp_lba_range, tmp_lba + idx);
+    char* tmp_buf;
+    tmp_buf = calloc(512, sizeof(char));
+
+    if (offset % 512 != 0) {
+        ftl_read(tmp_buf, tmp_lba);
+        memcpy(tmp_buf + (offset % 512), buf, (size > 512 - offset % 512) ? 512 - (offset % 512) : size);
+        ftl_write(tmp_buf, 1, tmp_lba);
+        idx = 1;
     }
+
+    while (idx < tmp_lba_range - 1)
+    {
+        ftl_write(buf + (512 * idx), 1, tmp_lba + idx);
+        idx++;
+    }
+
+    if (((size + offset) % 512) != 0) {
+        ftl_read(tmp_buf, tmp_lba + idx);
+        memcpy(tmp_buf, buf + (idx * 512), ((size + offset) % 512));
+        ftl_write(tmp_buf, 1, tmp_lba + idx);
+    } else {
+        ftl_write(buf + (512 * idx), 1, tmp_lba + idx);
+    }
+
+    free(tmp_buf);
     return size;
 }
 static int ssd_write(const char* path, const char* buf, size_t size,
