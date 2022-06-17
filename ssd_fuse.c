@@ -359,7 +359,6 @@ static int ssd_do_read(char* buf, size_t size, off_t offset)
     tmp_buf = calloc(tmp_lba_range * 512, sizeof(char));
 
     for (int i = 0; i < tmp_lba_range; i++) {
-        // TODO
         ftl_read(tmp_buf + (512 * i), tmp_lba + i);
     }
 
@@ -380,7 +379,6 @@ static int ssd_read(const char* path, char* buf, size_t size,
 static int ssd_do_write(const char* buf, size_t size, off_t offset)
 {
     int tmp_lba, tmp_lba_range;
-    int idx = 0;
 
     host_write_size += size;
     if (ssd_expand(offset + size) != 0)
@@ -394,25 +392,31 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
     char* tmp_buf;
     tmp_buf = calloc(512, sizeof(char));
 
-    if (offset % 512 != 0) {
+    const char *write_ptr = buf;
+    int first_block_offset = offset % 512;
+    int first_block_wsize = 512 - first_block_offset;
+
+    if (tmp_lba_range == 1) {
         ftl_read(tmp_buf, tmp_lba);
-        memcpy(tmp_buf + (offset % 512), buf, (size > 512 - offset % 512) ? 512 - (offset % 512) : size);
+        memcpy(tmp_buf + (offset % 512), buf, size);
         ftl_write(tmp_buf, 1, tmp_lba);
-        idx = 1;
-    }
 
-    while (idx < tmp_lba_range - 1)
-    {
-        ftl_write(buf + (512 * idx), 1, tmp_lba + idx);
-        idx++;
-    }
-
-    if (((size + offset) % 512) != 0) {
-        ftl_read(tmp_buf, tmp_lba + idx);
-        memcpy(tmp_buf, buf + (idx * 512), ((size + offset) % 512));
-        ftl_write(tmp_buf, 1, tmp_lba + idx);
     } else {
-        ftl_write(buf + (512 * idx), 1, tmp_lba + idx);
+        int idx = 0;
+
+        ftl_read(tmp_buf, tmp_lba);
+        memcpy(tmp_buf + first_block_offset, write_ptr, first_block_wsize);
+        ftl_write(tmp_buf, 1, tmp_lba);
+        write_ptr += first_block_wsize;
+        
+        for (idx = 1; idx < tmp_lba_range - 1; idx++) {
+            ftl_write(write_ptr, 1, tmp_lba + idx);
+            write_ptr += 512;
+        }
+
+        ftl_read(tmp_buf, tmp_lba + idx);
+        memcpy(tmp_buf, write_ptr, ((size + offset) % 512) == 0 ? 512: (size + offset) % 512);
+        ftl_write(tmp_buf, 1, tmp_lba + idx);
     }
 
     free(tmp_buf);
